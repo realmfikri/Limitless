@@ -28,26 +28,28 @@ type bookRequest struct {
 
 // OrderBook maintains bids and asks for a single symbol using price-time priority.
 type OrderBook struct {
-	cfg    OrderBookConfig
-	bids   priceTimeQueue
-	asks   priceTimeQueue
-	orders map[string]*orderEntry
-	seq    int64
-	reqCh  chan bookRequest
-	trades chan MatchResult
-	now    func() time.Time
+	cfg     OrderBookConfig
+	bids    priceTimeQueue
+	asks    priceTimeQueue
+	orders  map[string]*orderEntry
+	seq     int64
+	reqCh   chan bookRequest
+	trades  chan MatchResult
+	updates chan BookView
+	now     func() time.Time
 }
 
 // NewOrderBook builds an order book and launches the worker loop.
 func NewOrderBook(cfg OrderBookConfig) *OrderBook {
 	ob := &OrderBook{
-		cfg:    cfg,
-		bids:   priceTimeQueue{},
-		asks:   priceTimeQueue{},
-		orders: make(map[string]*orderEntry),
-		reqCh:  make(chan bookRequest),
-		trades: make(chan MatchResult, 16),
-		now:    time.Now,
+		cfg:     cfg,
+		bids:    priceTimeQueue{},
+		asks:    priceTimeQueue{},
+		orders:  make(map[string]*orderEntry),
+		reqCh:   make(chan bookRequest),
+		trades:  make(chan MatchResult, 16),
+		updates: make(chan BookView, 16),
+		now:     time.Now,
 	}
 	heap.Init(&ob.bids)
 	heap.Init(&ob.asks)
@@ -89,6 +91,11 @@ func (ob *OrderBook) Trades() <-chan MatchResult {
 	return ob.trades
 }
 
+// BookUpdates exposes the stream of top-of-book updates.
+func (ob *OrderBook) BookUpdates() <-chan BookView {
+	return ob.updates
+}
+
 // Stop gracefully terminates the worker loop.
 func (ob *OrderBook) Stop() {
 	ob.reqCh <- bookRequest{typ: requestStop}
@@ -98,15 +105,28 @@ func (ob *OrderBook) run() {
 	for req := range ob.reqCh {
 		switch req.typ {
 		case requestAdd:
-			req.resp <- ob.processAdd(req.order)
+			err := ob.processAdd(req.order)
+			req.resp <- err
+			if err == nil {
+				ob.publishView()
+			}
 		case requestCancel:
-			req.resp <- ob.processCancel(req.order.ID)
+			err := ob.processCancel(req.order.ID)
+			req.resp <- err
+			if err == nil {
+				ob.publishView()
+			}
 		case requestAmend:
-			req.resp <- ob.processAmend(req.order.ID, req.amendPrice, req.amendQty)
+			err := ob.processAmend(req.order.ID, req.amendPrice, req.amendQty)
+			req.resp <- err
+			if err == nil {
+				ob.publishView()
+			}
 		case requestSnapshot:
 			ob.handleSnapshot(req.view, req.resp)
 		case requestStop:
 			close(ob.trades)
+			close(ob.updates)
 			close(ob.reqCh)
 			return
 		}
@@ -255,6 +275,11 @@ func min(a, b int64) int64 {
 }
 
 func (ob *OrderBook) handleSnapshot(view chan<- BookView, resp chan<- error) {
+	view <- ob.snapshotView()
+	resp <- nil
+}
+
+func (ob *OrderBook) snapshotView() BookView {
 	snapshot := BookView{}
 	if best := ob.bids.peek(); best != nil {
 		copy := *best.order
@@ -264,6 +289,13 @@ func (ob *OrderBook) handleSnapshot(view chan<- BookView, resp chan<- error) {
 		copy := *best.order
 		snapshot.BestAsk = &copy
 	}
-	view <- snapshot
-	resp <- nil
+	return snapshot
+}
+
+func (ob *OrderBook) publishView() {
+	view := ob.snapshotView()
+	select {
+	case ob.updates <- view:
+	default:
+	}
 }
