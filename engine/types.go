@@ -35,6 +35,12 @@ type Order struct {
 	Sequence  int64
 }
 
+// BookView summarizes top-of-book information for a symbol.
+type BookView struct {
+	BestBid *Order
+	BestAsk *Order
+}
+
 // MatchResult captures a completed trade.
 type MatchResult struct {
 	Symbol      string
