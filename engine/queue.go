@@ -58,8 +58,8 @@ func (q priceTimeQueue) peek() *orderEntry {
 	return q[0]
 }
 
-func (q *priceTimeQueue) remove(entry *orderEntry) {
-	heap.Remove(q, entry.index)
+func (q *priceTimeQueue) remove(entry *orderEntry) *orderEntry {
+	return heap.Remove(q, entry.index).(*orderEntry)
 }
 
 func (q *priceTimeQueue) findWorstIndex(isBid bool) int {
@@ -89,7 +89,7 @@ func (q *priceTimeQueue) findWorstIndex(isBid bool) int {
 	return worstIdx
 }
 
-func trimDepth(q *priceTimeQueue, maxDepth int, isBid bool, orderIndex map[string]*orderEntry) {
+func trimDepth(q *priceTimeQueue, maxDepth int, isBid bool, orderIndex map[string]*orderEntry, release func(*orderEntry)) {
 	for maxDepth > 0 && q.Len() > maxDepth {
 		idx := q.findWorstIndex(isBid)
 		if idx < 0 {
@@ -97,5 +97,8 @@ func trimDepth(q *priceTimeQueue, maxDepth int, isBid bool, orderIndex map[strin
 		}
 		entry := heap.Remove(q, idx).(*orderEntry)
 		delete(orderIndex, entry.order.ID)
+		if release != nil {
+			release(entry)
+		}
 	}
 }
