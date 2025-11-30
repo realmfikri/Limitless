@@ -13,6 +13,7 @@ const (
 	requestAdd requestType = iota
 	requestCancel
 	requestAmend
+	requestSnapshot
 	requestStop
 )
 
@@ -22,6 +23,7 @@ type bookRequest struct {
 	amendPrice *int64
 	amendQty   *int64
 	resp       chan error
+	view       chan BookView
 }
 
 // OrderBook maintains bids and asks for a single symbol using price-time priority.
@@ -74,6 +76,14 @@ func (ob *OrderBook) AmendOrder(id string, price *int64, qty *int64) error {
 	return <-resp
 }
 
+// Snapshot returns a view of the best bid and ask for the book.
+func (ob *OrderBook) Snapshot() (BookView, error) {
+	resp := make(chan error, 1)
+	view := make(chan BookView, 1)
+	ob.reqCh <- bookRequest{typ: requestSnapshot, resp: resp, view: view}
+	return <-view, <-resp
+}
+
 // Trades exposes the stream of executed trades.
 func (ob *OrderBook) Trades() <-chan MatchResult {
 	return ob.trades
@@ -93,6 +103,8 @@ func (ob *OrderBook) run() {
 			req.resp <- ob.processCancel(req.order.ID)
 		case requestAmend:
 			req.resp <- ob.processAmend(req.order.ID, req.amendPrice, req.amendQty)
+		case requestSnapshot:
+			ob.handleSnapshot(req.view, req.resp)
 		case requestStop:
 			close(ob.trades)
 			close(ob.reqCh)
@@ -240,4 +252,18 @@ func min(a, b int64) int64 {
 		return a
 	}
 	return b
+}
+
+func (ob *OrderBook) handleSnapshot(view chan<- BookView, resp chan<- error) {
+	snapshot := BookView{}
+	if best := ob.bids.peek(); best != nil {
+		copy := *best.order
+		snapshot.BestBid = &copy
+	}
+	if best := ob.asks.peek(); best != nil {
+		copy := *best.order
+		snapshot.BestAsk = &copy
+	}
+	view <- snapshot
+	resp <- nil
 }

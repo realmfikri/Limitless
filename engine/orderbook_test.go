@@ -99,3 +99,26 @@ func TestMaxDepthTrimming(t *testing.T) {
 		t.Fatalf("lowest priority order should have been trimmed")
 	}
 }
+
+func TestSnapshotCopiesTopLevels(t *testing.T) {
+	ob := NewOrderBook(OrderBookConfig{Symbol: "XRPUSD", TickSize: 1, MaxDepth: 5})
+	defer ob.Stop()
+	ob.now = func() time.Time { return time.Unix(0, 0) }
+
+	_ = ob.SubmitOrder(Order{ID: "bid1", Symbol: "XRPUSD", Side: Buy, Type: Limit, Price: 10, Quantity: 1})
+	_ = ob.SubmitOrder(Order{ID: "ask1", Symbol: "XRPUSD", Side: Sell, Type: Limit, Price: 12, Quantity: 1})
+
+	view, err := ob.Snapshot()
+	if err != nil {
+		t.Fatalf("snapshot failed: %v", err)
+	}
+	if view.BestBid == nil || view.BestAsk == nil {
+		t.Fatalf("expected best levels present in snapshot: %+v", view)
+	}
+
+	view.BestBid.Price = 1
+	second, _ := ob.Snapshot()
+	if second.BestBid.Price != 10 {
+		t.Fatalf("snapshot should return copies, expected 10 got %d", second.BestBid.Price)
+	}
+}
