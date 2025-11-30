@@ -126,6 +126,9 @@ func (s *server) withAuth(next http.Handler) http.Handler {
 		}
 
 		token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+		if token == "" {
+			token = r.URL.Query().Get("token")
+		}
 		if token != s.authToken {
 			w.WriteHeader(http.StatusUnauthorized)
 			_, _ = w.Write([]byte("missing or invalid token"))
