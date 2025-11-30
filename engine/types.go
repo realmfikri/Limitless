@@ -53,7 +53,9 @@ type MatchResult struct {
 
 // OrderBookConfig controls book parameters.
 type OrderBookConfig struct {
-	Symbol   string
-	TickSize int64
-	MaxDepth int
+	Symbol        string
+	TickSize      int64
+	MaxDepth      int
+	RequestBuffer int
+	Inline        bool
 }

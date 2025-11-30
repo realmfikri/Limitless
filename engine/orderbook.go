@@ -4,6 +4,7 @@ import (
 	"container/heap"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 )
 
@@ -28,62 +29,165 @@ type bookRequest struct {
 
 // OrderBook maintains bids and asks for a single symbol using price-time priority.
 type OrderBook struct {
-	cfg     OrderBookConfig
-	bids    priceTimeQueue
-	asks    priceTimeQueue
-	orders  map[string]*orderEntry
-	seq     int64
-	reqCh   chan bookRequest
-	trades  chan MatchResult
-	updates chan BookView
-	now     func() time.Time
+	cfg        OrderBookConfig
+	bids       priceTimeQueue
+	asks       priceTimeQueue
+	orders     map[string]*orderEntry
+	seq        int64
+	reqCh      chan bookRequest
+	trades     chan MatchResult
+	updates    chan BookView
+	now        func() time.Time
+	entryPool  sync.Pool
+	errChPool  sync.Pool
+	viewChPool sync.Pool
+	inline     bool
+	closeOnce  sync.Once
 }
 
 // NewOrderBook builds an order book and launches the worker loop.
 func NewOrderBook(cfg OrderBookConfig) *OrderBook {
-	ob := &OrderBook{
-		cfg:     cfg,
-		bids:    priceTimeQueue{},
-		asks:    priceTimeQueue{},
-		orders:  make(map[string]*orderEntry),
-		reqCh:   make(chan bookRequest),
-		trades:  make(chan MatchResult, 16),
-		updates: make(chan BookView, 16),
-		now:     time.Now,
+	if cfg.RequestBuffer < 0 {
+		cfg.RequestBuffer = 0
 	}
+
+	ob := &OrderBook{
+		cfg:        cfg,
+		bids:       priceTimeQueue{},
+		asks:       priceTimeQueue{},
+		orders:     make(map[string]*orderEntry),
+		trades:     make(chan MatchResult, 1024),
+		updates:    make(chan BookView, 16),
+		now:        time.Now,
+		inline:     cfg.Inline,
+		entryPool:  sync.Pool{New: func() any { return &orderEntry{} }},
+		errChPool:  sync.Pool{New: func() any { return make(chan error, 1) }},
+		viewChPool: sync.Pool{New: func() any { return make(chan BookView, 1) }},
+	}
+
 	heap.Init(&ob.bids)
 	heap.Init(&ob.asks)
-	go ob.run()
+
+	if !cfg.Inline {
+		ob.reqCh = make(chan bookRequest, cfg.RequestBuffer)
+		go ob.run()
+	}
+
 	return ob
+}
+
+func (ob *OrderBook) getErrCh() chan error {
+	return ob.errChPool.Get().(chan error)
+}
+
+func (ob *OrderBook) putErrCh(ch chan error) {
+	for len(ch) > 0 {
+		<-ch
+	}
+	ob.errChPool.Put(ch)
+}
+
+func (ob *OrderBook) getViewCh() chan BookView {
+	return ob.viewChPool.Get().(chan BookView)
+}
+
+func (ob *OrderBook) putViewCh(ch chan BookView) {
+	for len(ch) > 0 {
+		<-ch
+	}
+	ob.viewChPool.Put(ch)
+}
+
+func (ob *OrderBook) newEntry(order *Order) *orderEntry {
+	entry := ob.entryPool.Get().(*orderEntry)
+	entry.order = order
+	entry.isBid = order.Side == Buy
+	return entry
+}
+
+func (ob *OrderBook) releaseEntry(entry *orderEntry) {
+	if entry == nil {
+		return
+	}
+	entry.order = nil
+	entry.index = 0
+	entry.isBid = false
+	ob.entryPool.Put(entry)
+}
+
+func (ob *OrderBook) closeChannels() {
+	close(ob.trades)
+	close(ob.updates)
+	if ob.reqCh != nil {
+		close(ob.reqCh)
+	}
 }
 
 // SubmitOrder enqueues a new order for processing.
 func (ob *OrderBook) SubmitOrder(order Order) error {
-	resp := make(chan error, 1)
+	if ob.inline {
+		err := ob.processAdd(order)
+		if err == nil {
+			ob.publishView()
+		}
+		return err
+	}
+
+	resp := ob.getErrCh()
 	ob.reqCh <- bookRequest{typ: requestAdd, order: order, resp: resp}
-	return <-resp
+	err := <-resp
+	ob.putErrCh(resp)
+	return err
 }
 
 // CancelOrder cancels an active order by ID.
 func (ob *OrderBook) CancelOrder(id string) error {
-	resp := make(chan error, 1)
+	if ob.inline {
+		err := ob.processCancel(id)
+		if err == nil {
+			ob.publishView()
+		}
+		return err
+	}
+
+	resp := ob.getErrCh()
 	ob.reqCh <- bookRequest{typ: requestCancel, order: Order{ID: id}, resp: resp}
-	return <-resp
+	err := <-resp
+	ob.putErrCh(resp)
+	return err
 }
 
 // AmendOrder updates price and/or quantity for an existing resting order.
 func (ob *OrderBook) AmendOrder(id string, price *int64, qty *int64) error {
-	resp := make(chan error, 1)
+	if ob.inline {
+		err := ob.processAmend(id, price, qty)
+		if err == nil {
+			ob.publishView()
+		}
+		return err
+	}
+
+	resp := ob.getErrCh()
 	ob.reqCh <- bookRequest{typ: requestAmend, order: Order{ID: id}, amendPrice: price, amendQty: qty, resp: resp}
-	return <-resp
+	err := <-resp
+	ob.putErrCh(resp)
+	return err
 }
 
 // Snapshot returns a view of the best bid and ask for the book.
 func (ob *OrderBook) Snapshot() (BookView, error) {
-	resp := make(chan error, 1)
-	view := make(chan BookView, 1)
+	if ob.inline {
+		return ob.snapshotView(), nil
+	}
+
+	resp := ob.getErrCh()
+	view := ob.getViewCh()
 	ob.reqCh <- bookRequest{typ: requestSnapshot, resp: resp, view: view}
-	return <-view, <-resp
+	viewResp := <-view
+	err := <-resp
+	ob.putErrCh(resp)
+	ob.putViewCh(view)
+	return viewResp, err
 }
 
 // Trades exposes the stream of executed trades.
@@ -98,7 +202,13 @@ func (ob *OrderBook) BookUpdates() <-chan BookView {
 
 // Stop gracefully terminates the worker loop.
 func (ob *OrderBook) Stop() {
-	ob.reqCh <- bookRequest{typ: requestStop}
+	ob.closeOnce.Do(func() {
+		if ob.inline {
+			ob.closeChannels()
+			return
+		}
+		ob.reqCh <- bookRequest{typ: requestStop}
+	})
 }
 
 func (ob *OrderBook) run() {
@@ -125,9 +235,7 @@ func (ob *OrderBook) run() {
 		case requestSnapshot:
 			ob.handleSnapshot(req.view, req.resp)
 		case requestStop:
-			close(ob.trades)
-			close(ob.updates)
-			close(ob.reqCh)
+			ob.closeChannels()
 			return
 		}
 	}
@@ -193,21 +301,22 @@ func (ob *OrderBook) match(incoming *Order, opposing *priceTimeQueue, resting *p
 		}
 
 		if best.order.Remaining == 0 {
-			heap.Pop(opposing)
+			entry := heap.Pop(opposing).(*orderEntry)
 			delete(ob.orders, best.order.ID)
+			ob.releaseEntry(entry)
 		} else {
 			heap.Fix(opposing, best.index)
 		}
 	}
 
 	if incoming.Remaining > 0 && incoming.Type == Limit {
-		entry := &orderEntry{order: incoming, isBid: incoming.Side == Buy}
+		entry := ob.newEntry(incoming)
 		heap.Push(resting, entry)
 		ob.orders[incoming.ID] = entry
 		if incoming.Side == Buy {
-			trimDepth(resting, ob.cfg.MaxDepth, true, ob.orders)
+			trimDepth(resting, ob.cfg.MaxDepth, true, ob.orders, ob.releaseEntry)
 		} else {
-			trimDepth(resting, ob.cfg.MaxDepth, false, ob.orders)
+			trimDepth(resting, ob.cfg.MaxDepth, false, ob.orders, ob.releaseEntry)
 		}
 	}
 }
@@ -225,9 +334,9 @@ func (ob *OrderBook) processCancel(id string) error {
 		return fmt.Errorf("order %s not found", id)
 	}
 	if entry.isBid {
-		ob.bids.remove(entry)
+		ob.releaseEntry(ob.bids.remove(entry))
 	} else {
-		ob.asks.remove(entry)
+		ob.releaseEntry(ob.asks.remove(entry))
 	}
 	delete(ob.orders, id)
 	return nil
@@ -259,10 +368,10 @@ func (ob *OrderBook) processAmend(id string, newPrice *int64, newQty *int64) err
 
 	if entry.isBid {
 		heap.Fix(&ob.bids, entry.index)
-		trimDepth(&ob.bids, ob.cfg.MaxDepth, true, ob.orders)
+		trimDepth(&ob.bids, ob.cfg.MaxDepth, true, ob.orders, ob.releaseEntry)
 	} else {
 		heap.Fix(&ob.asks, entry.index)
-		trimDepth(&ob.asks, ob.cfg.MaxDepth, false, ob.orders)
+		trimDepth(&ob.asks, ob.cfg.MaxDepth, false, ob.orders, ob.releaseEntry)
 	}
 	return nil
 }
